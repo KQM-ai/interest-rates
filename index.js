@@ -281,25 +281,25 @@ app.get('/', (_, res) => {
   });
 });
 app.post('/send-message', async (req, res) => {
-  const jid = req.body.jid || (req.body.groupId ? `${req.body.groupId}@g.us` : null);
-  const text = req.body.text || req.body.message;
+  const { jid, text } = req.body;
 
   if (!jid || !text) {
-    return res.status(400).json({ success: false, error: 'Missing jid/groupId or text/message' });
+    return res.status(400).json({ success: false, error: 'Missing jid or text' });
   }
 
-  if (!client) {
+  if (!client || !client.info) {
     return res.status(503).json({ success: false, error: 'WhatsApp client not ready' });
   }
 
   try {
-    const sentMessage = await client.sendMessage(jid, { text });
-    return res.status(200).json({ success: true, messageId: sentMessage.key.id });
+    const sentMessage = await client.sendMessage(jid, text); // ✅ Just pass `text` as string for whatsapp-web.js
+    return res.status(200).json({ success: true, messageId: sentMessage.id._serialized });
   } catch (err) {
-    console.error('Error sending message:', err);
+    console.error('Message send failed:', err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
+
 
 
 
