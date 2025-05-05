@@ -281,10 +281,11 @@ app.get('/', (_, res) => {
   });
 });
 app.post('/send-message', async (req, res) => {
-  const { jid, text } = req.body;
+  const jid = req.body.jid || (req.body.groupId ? `${req.body.groupId}@g.us` : null);
+  const text = req.body.text || req.body.message;
 
   if (!jid || !text) {
-    return res.status(400).json({ success: false, error: 'Missing jid or text' });
+    return res.status(400).json({ success: false, error: 'Missing jid/groupId or text/message' });
   }
 
   if (!client) {
@@ -292,16 +293,14 @@ app.post('/send-message', async (req, res) => {
   }
 
   try {
-    const isGroup = jid.endsWith('@g.us');
-    const formattedJid = isGroup ? jid : jid; // you could validate more if needed
-
-    const sentMessage = await client.sendMessage(formattedJid, { text }); // 👈 wrap `text` as object if using Baileys
+    const sentMessage = await client.sendMessage(jid, { text });
     return res.status(200).json({ success: true, messageId: sentMessage.key.id });
   } catch (err) {
-    console.error('Failed to send message:', err);
+    console.error('Error sending message:', err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
+
 
 
 app.listen(PORT, () => {
