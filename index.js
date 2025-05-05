@@ -182,8 +182,8 @@ async function handleIncomingMessage(msg) {
   }
 
   const isImportant =
-    text.toLowerCase().includes('Dear Valued Partners') ||
-    (hasReply && replyInfo?.text?.toLowerCase().includes('Dear Valued Partners'));
+    text.toLowerCase().includes('dear valued partners') ||
+    (hasReply && replyInfo?.text?.toLowerCase().includes('dear valued partners'));
 
   if (!isImportant) {
     log('info', '🚫 Ignored non-interest rates message.');
