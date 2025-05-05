@@ -182,11 +182,11 @@ async function handleIncomingMessage(msg) {
   }
 
   const isImportant =
-    text.toLowerCase().includes('valuation') ||
-    (hasReply && replyInfo?.text?.toLowerCase().includes('valuation'));
+    text.toLowerCase().includes('Dear Valued Partners') ||
+    (hasReply && replyInfo?.text?.toLowerCase().includes('Dear Valued Partners'));
 
   if (!isImportant) {
-    log('info', '🚫 Ignored non-valuation message.');
+    log('info', '🚫 Ignored non-interest rates message.');
     return;
   }
 
