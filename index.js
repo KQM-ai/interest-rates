@@ -282,10 +282,10 @@ app.get('/', (_, res) => {
 });
 
 app.post('/send-message', async (req, res) => {
-  const { groupId, message, imageUrl } = req.body;
+  const { jid, message, imageUrl } = req.body;
 
-  if (!groupId || (!message && !imageUrl)) {
-    return res.status(400).json({ success: false, error: 'Missing groupId or content' });
+  if (!jid || (!message && !imageUrl)) {
+    return res.status(400).json({ success: false, error: 'Missing jid or message/imageUrl' });
   }
 
   if (!client) {
@@ -293,25 +293,22 @@ app.post('/send-message', async (req, res) => {
   }
 
   try {
-    const formattedGroupId = groupId.endsWith('@g.us') ? groupId : `${groupId}@g.us`;
-
+    // Send media if imageUrl provided
     if (imageUrl) {
-      // Fetch image and send it as media
       const media = await MessageMedia.fromUrl(imageUrl);
-      const sentMessage = await client.sendMessage(formattedGroupId, media, { caption: message || '' });
+      const sentMessage = await client.sendMessage(jid, media, {
+        caption: message || '',
+      });
       return res.status(200).json({ success: true, messageId: sentMessage.id.id });
     }
 
-    // Otherwise send plain text
-    const sentMessage = await client.sendMessage(formattedGroupId, message);
+    // Send plain text message
+    const sentMessage = await client.sendMessage(jid, message);
     return res.status(200).json({ success: true, messageId: sentMessage.id.id });
-
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
-
-
 
 app.listen(PORT, () => {
   log('info', `🚀 Server started on http://localhost:${PORT}`);
