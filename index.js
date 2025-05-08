@@ -5,6 +5,7 @@ const qrcode = require('qrcode-terminal');
 const express = require('express');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
+const { Client, RemoteAuth, MessageMedia } = require('whatsapp-web.js');
 
 // --- Config ---
 const PORT = process.env.PORT || 3000;
@@ -280,26 +281,36 @@ app.get('/', (_, res) => {
     timestamp: new Date().toISOString(),
   });
 });
-app.post('/send-message', async (req, res) => {
-  const { jid, text } = req.body;
 
-  if (!jid || !text) {
-    return res.status(400).json({ success: false, error: 'Missing jid or text' });
+app.post('/send-message', async (req, res) => {
+  const { groupId, message, imageUrl } = req.body;
+
+  if (!groupId || (!message && !imageUrl)) {
+    return res.status(400).json({ success: false, error: 'Missing groupId or content' });
   }
 
-  if (!client || !client.info) {
+  if (!client) {
     return res.status(503).json({ success: false, error: 'WhatsApp client not ready' });
   }
 
   try {
-    const sentMessage = await client.sendMessage(jid, text); // ✅ Just pass `text` as string for whatsapp-web.js
-    return res.status(200).json({ success: true, messageId: sentMessage.id._serialized });
+    const formattedGroupId = groupId.endsWith('@g.us') ? groupId : `${groupId}@g.us`;
+
+    if (imageUrl) {
+      // Fetch image and send it as media
+      const media = await MessageMedia.fromUrl(imageUrl);
+      const sentMessage = await client.sendMessage(formattedGroupId, media, { caption: message || '' });
+      return res.status(200).json({ success: true, messageId: sentMessage.id.id });
+    }
+
+    // Otherwise send plain text
+    const sentMessage = await client.sendMessage(formattedGroupId, message);
+    return res.status(200).json({ success: true, messageId: sentMessage.id.id });
+
   } catch (err) {
-    console.error('Message send failed:', err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
-
 
 
 
