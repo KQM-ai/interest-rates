@@ -415,7 +415,7 @@ function setupClientEvents(c) {
     log('info', `Connection state changed to: ${state}`);
     
     // Try to save session on state change
-    if (state === 'CONNECTED' && c.authStrategy?.save) {
+    if (state === 'CONNECTED' && c.authStrategy) {
       try {
         log('info', '📥 Attempting to save session on state change to CONNECTED');
         safelyTriggerSessionSave(c);
