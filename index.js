@@ -188,9 +188,6 @@ function setupClientEvents(c) {
     const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qr)}&size=300x300`;
     log('warn', `📱 Scan QR Code: ${qrUrl}`);
     
-    // Also generate QR code in terminal for direct access
-    qrcode.generate(qr, { small: true });
-    
     // Reset connection retry count when we get a QR code
     connectionRetryCount = 0;
   });
