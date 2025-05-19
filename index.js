@@ -9,7 +9,7 @@ const { Client, RemoteAuth, MessageMedia } = require('whatsapp-web.js');
 // --- Config ---
 const PORT = process.env.PORT || 3000;
 const SESSION_ID = process.env.WHATSAPP_SESSION_ID || 'default_session';
-const BOT_VERSION = '1.0.2'; // Updated version
+const BOT_VERSION = '1.0.3'; // Updated version
 const startedAt = Date.now();
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -17,6 +17,7 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const MEMORY_THRESHOLD_MB = parseInt(process.env.MEMORY_THRESHOLD_MB || '450');
 const RECONNECT_DELAY = parseInt(process.env.RECONNECT_DELAY || '10000');
 const WATCHDOG_INTERVAL = parseInt(process.env.WATCHDOG_INTERVAL || '300000'); // 5 minutes
+const DEBUG_SESSION = true; // Enable session debugging
 
 // Add validation for critical environment variables
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
@@ -50,7 +51,7 @@ log.debug = (message, ...args) => {
   console.log(formatted, ...args);
 };
 
-// --- Supabase Store with improved error handling ---
+// --- Supabase Store with improved error handling and debugging ---
 class SupabaseStore {
   constructor(supabaseClient, sessionId) {
     this.supabase = supabaseClient;
@@ -86,6 +87,11 @@ class SupabaseStore {
         .eq('session_key', session);
 
       if (error) throw new Error(`Supabase error in sessionExists: ${error.message}`);
+      
+      if (DEBUG_SESSION) {
+        log('info', `Session exists check: ${count > 0 ? 'found' : 'not found'}`);
+      }
+      
       return count > 0;
     }, false);
   }
@@ -100,21 +106,39 @@ class SupabaseStore {
         .single();
 
       if (error) throw new Error(`Failed to extract session: ${error.message}`);
+      
+      if (DEBUG_SESSION) {
+        log('info', `Session extracted, data ${data?.session_data ? 'present' : 'not present'}`);
+        if (data?.session_data) {
+          const sessionSize = JSON.stringify(data.session_data).length;
+          log('info', `Extracted session data size: ${sessionSize} bytes`);
+        }
+      }
+      
       return data?.session_data || null;
     }, null);
   }
 
   async save(sessionData) {
+    if (DEBUG_SESSION) {
+      const sessionSize = JSON.stringify(sessionData).length;
+      log('info', `Saving session data to Supabase (${sessionSize} bytes)`);
+    }
+    
     return this._executeWithRetry(async () => {
       const { error } = await this.supabase
         .from('whatsapp_sessions')
         .upsert({ 
           session_key: this.sessionId, 
           session_data: sessionData
-          // Only using fields that exist in your schema
         }, { onConflict: 'session_key' });
 
       if (error) throw new Error(`Failed to save session: ${error.message}`);
+      
+      if (DEBUG_SESSION) {
+        log('info', `Session saved successfully`);
+      }
+      
       return true;
     }, false);
   }
@@ -127,6 +151,11 @@ class SupabaseStore {
         .eq('session_key', this.sessionId);
 
       if (error) throw new Error(`Failed to delete session: ${error.message}`);
+      
+      if (DEBUG_SESSION) {
+        log('info', `Session deleted successfully`);
+      }
+      
       return true;
     }, false);
   }
@@ -157,7 +186,7 @@ function createWhatsAppClient() {
   return new Client({
     authStrategy: new RemoteAuth({
       store: supabaseStore,
-      backupSyncIntervalMs: 300000, // 5 minutes
+      backupSyncIntervalMs: 30000, // Reduced from 300000 to 30000 (30 seconds) for more frequent saves
       dataPath: sessionPath,
     }),
     puppeteer: {
@@ -190,6 +219,7 @@ function createWhatsAppClient() {
     restartOnAuthFail: true,
     takeoverOnConflict: true,
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    multiDevice: true, // Enable multi-device beta for better session persistence
   });
 }
 
@@ -221,15 +251,46 @@ function setupClientEvents(c) {
   c.on('authenticated', () => {
     log('info', '🔐 Client authenticated.');
     currentQRCode = null; // Clear QR code once authenticated
+    
+    // Try to save session immediately after authentication
+    if (DEBUG_SESSION) {
+      log('info', '📥 Forcing immediate session save after authentication');
+      try {
+        c.authStrategy.save();
+      } catch (err) {
+        log('error', `Failed to force session save: ${err.message}`);
+      }
+    }
   });
 
   c.on('remote_session_saved', () => {
-    log('info', '💾 Session saved to Supabase.');
+    // Add more detailed session state logging
+    if (c.authStrategy?.authState) {
+      try {
+        const sessionSize = JSON.stringify(c.authStrategy.authState).length;
+        log('info', `💾 Session saved to Supabase (${sessionSize} bytes)`);
+      } catch (err) {
+        log('info', `💾 Session saved to Supabase (size unknown: ${err.message})`);
+      }
+    } else {
+      log('info', '💾 Session saved to Supabase.');
+    }
   });
 
   c.on('disconnected', async reason => {
     log('warn', `Client disconnected: ${reason}`);
     currentQRCode = null;
+    
+    // Try to save session before disconnecting if possible
+    if (c.authStrategy?.authState && reason !== 'NAVIGATION') {
+      try {
+        log('info', '📥 Attempting to save session before disconnection');
+        await c.authStrategy.save();
+        log('info', '📥 Session saved before disconnection');
+      } catch (err) {
+        log('error', `📥 Failed to save session before disconnection: ${err.message}`);
+      }
+    }
     
     if (client) {
       try {
@@ -294,6 +355,16 @@ function setupClientEvents(c) {
   
   c.on('change_state', state => {
     log('info', `Connection state changed to: ${state}`);
+    
+    // Try to save session on state change
+    if (state === 'CONNECTED' && c.authStrategy?.save) {
+      try {
+        log('info', '📥 Attempting to save session on state change to CONNECTED');
+        c.authStrategy.save();
+      } catch (err) {
+        log('error', `Failed to save session on state change: ${err.message}`);
+      }
+    }
   });
 }
 
@@ -448,6 +519,43 @@ async function sendToN8nWebhook(payload, attempt = 0) {
   }
 }
 
+// Function to check session status in Supabase
+async function checkSessionStatus() {
+  try {
+    log('info', '🔍 Checking WhatsApp session status in Supabase...');
+    
+    const { data, error } = await supabase
+      .from('whatsapp_sessions')
+      .select('*')
+      .eq('session_key', SESSION_ID)
+      .limit(1)
+      .single();
+    
+    if (error) {
+      log('error', `❌ Failed to check session status: ${error.message}`);
+      return false;
+    }
+    
+    if (!data) {
+      log('info', '❓ No session found in Supabase');
+      return false;
+    }
+    
+    const sessionDataSize = JSON.stringify(data.session_data).length;
+    log('info', `✅ Found session in Supabase (${sessionDataSize} bytes)`);
+    
+    if (sessionDataSize < 100) {
+      log('warn', '⚠️ Session data appears to be too small, might be invalid');
+      return false;
+    }
+    
+    return true;
+  } catch (err) {
+    log('error', `❌ Error checking session status: ${err.message}`);
+    return false;
+  }
+}
+
 // Improved client starter with mutex to prevent multiple initializations
 async function startClient() {
   if (isClientInitializing) {
@@ -464,12 +572,26 @@ async function startClient() {
   currentQRCode = null;
   
   try {
+    // Check if we have a valid session before starting
+    await checkSessionStatus();
+    
     log('info', '🚀 Starting WhatsApp client...');
     client = createWhatsAppClient();
     setupClientEvents(client);
 
     await client.initialize();
     log('info', '✅ WhatsApp client initialized.');
+    
+    // Try to force save session right after successful initialization
+    if (client.authStrategy?.authState) {
+      try {
+        log('info', '📥 Forcing session save after initialization');
+        await client.authStrategy.save();
+        log('info', '📥 Session saved successfully after initialization');
+      } catch (err) {
+        log('error', `📥 Failed to save session after initialization: ${err.message}`);
+      }
+    }
   } catch (err) {
     log('error', `❌ WhatsApp client failed to initialize: ${err.message}`);
     
@@ -595,6 +717,23 @@ app.get('/qr', (req, res) => {
   `);
 });
 
+// Session check endpoint
+app.get('/session', async (req, res) => {
+  try {
+    const hasSession = await checkSessionStatus();
+    
+    return res.status(200).json({
+      hasSession,
+      clientState: client ? await client.getState() : 'not_initialized',
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    return res.status(500).json({
+      error: err.message
+    });
+  }
+});
+
 // Message sending endpoint - no API key required as requested
 app.post('/send-message', async (req, res) => {
   const { jid, message, imageUrl } = req.body;
@@ -695,6 +834,9 @@ app.get('/status', async (req, res) => {
     const connectionState = client.pupPage ? 'connected' : 'disconnected';
     const mem = process.memoryUsage();
     
+    // Check session status
+    const sessionStatus = await checkSessionStatus();
+    
     return res.status(200).json({
       status: state,
       connectionState,
@@ -708,6 +850,7 @@ app.get('/status', async (req, res) => {
       },
       messagesProcessed: messageCount,
       needsQrScan: Boolean(currentQRCode),
+      hasSession: sessionStatus,
       timestamp: new Date().toISOString()
     });
   } catch (err) {
@@ -715,6 +858,33 @@ app.get('/status', async (req, res) => {
     return res.status(500).json({ 
       status: 'error',
       error: err.message
+    });
+  }
+});
+
+// Force session save endpoint
+app.post('/save-session', async (req, res) => {
+  if (!client || !client.authStrategy) {
+    return res.status(503).json({ 
+      success: false, 
+      error: 'WhatsApp client not ready or not authenticated' 
+    });
+  }
+  
+  try {
+    log('info', '📥 Manual session save requested');
+    await client.authStrategy.save();
+    log('info', '📥 Manual session save completed');
+    
+    return res.status(200).json({ 
+      success: true, 
+      message: 'Session saved successfully'
+    });
+  } catch (err) {
+    log('error', `Failed to manually save session: ${err.message}`);
+    return res.status(500).json({ 
+      success: false, 
+      error: err.message 
     });
   }
 });
@@ -727,6 +897,17 @@ app.post('/restart', async (req, res) => {
     success: true, 
     message: 'Restart initiated' 
   });
+  
+  // Try to save session before restarting
+  if (client && client.authStrategy) {
+    try {
+      log('info', '📥 Saving session before manual restart');
+      await client.authStrategy.save();
+      log('info', '📥 Session saved before manual restart');
+    } catch (err) {
+      log('error', `Failed to save session before manual restart: ${err.message}`);
+    }
+  }
   
   // Destroy and restart client
   if (client) {
@@ -758,9 +939,33 @@ app.listen(PORT, () => {
     log.debug('🏓 Self-ping successful');
   }, 60000); // Every minute
   
+  // Additional interval to force session saves periodically
+  setInterval(async () => {
+    if (client && client.authStrategy && client.getState && await client.getState() === 'CONNECTED') {
+      try {
+        log('info', '📥 Periodic session save triggered');
+        await client.authStrategy.save();
+        log('info', '📥 Periodic session save completed');
+      } catch (err) {
+        log('error', `Failed to perform periodic session save: ${err.message}`);
+      }
+    }
+  }, 10 * 60 * 1000); // Every 10 minutes
+  
   // Handle SIGTERM for graceful shutdown
   process.on('SIGTERM', async () => {
     log('info', '📴 SIGTERM received, shutting down gracefully');
+    
+    // Try to save session before shutdown
+    if (client && client.authStrategy) {
+      try {
+        log('info', '📥 Saving session before shutdown');
+        await client.authStrategy.save();
+        log('info', '📥 Session saved before shutdown');
+      } catch (err) {
+        log('error', `Failed to save session before shutdown: ${err.message}`);
+      }
+    }
     
     if (client) {
       try {
@@ -804,6 +1009,21 @@ setInterval(async () => {
     const state = await client.getState();
     log('info', `✅ Watchdog: client state is "${state}".`);
 
+    // Save session on successful watchdog check
+    if (state === 'CONNECTED' && client.authStrategy) {
+      try {
+        if (DEBUG_SESSION) {
+          log('info', '📥 Watchdog forcing session save');
+        }
+        await client.authStrategy.save();
+        if (DEBUG_SESSION) {
+          log('info', '📥 Watchdog session save successful');
+        }
+      } catch (err) {
+        log('error', `Failed to save session during watchdog check: ${err.message}`);
+      }
+    }
+
     // Check if memory exceeds threshold (450MB) and perform cleanup if needed
     if (parseFloat(rssMB) > MEMORY_THRESHOLD_MB) {
       log('warn', `⚠️ Memory usage exceeded ${MEMORY_THRESHOLD_MB}MB (${rssMB}MB). Performing cleanup...`);
@@ -821,6 +1041,18 @@ setInterval(async () => {
         // If still too high, restart the client
         if (parseFloat(afterRssMB) > MEMORY_THRESHOLD_MB) {
           log('warn', `⚠️ Memory still high after GC. Restarting client...`);
+          
+          // Try to save session before restart
+          if (client.authStrategy) {
+            try {
+              log('info', '📥 Saving session before memory-triggered restart');
+              await client.authStrategy.save();
+              log('info', '📥 Session saved before memory-triggered restart');
+            } catch (err) {
+              log('error', `Failed to save session before memory-triggered restart: ${err.message}`);
+            }
+          }
+          
           await client.destroy().catch(err => 
             log('error', `Error destroying client during memory cleanup: ${err.message}`)
           );
@@ -830,6 +1062,18 @@ setInterval(async () => {
       } else {
         // If GC not available, restart client to reduce memory
         log('warn', `⚠️ GC not available. Restarting client to reduce memory...`);
+        
+        // Try to save session before restart
+        if (client.authStrategy) {
+          try {
+            log('info', '📥 Saving session before memory-triggered restart');
+            await client.authStrategy.save();
+            log('info', '📥 Session saved before memory-triggered restart');
+          } catch (err) {
+            log('error', `Failed to save session before memory-triggered restart: ${err.message}`);
+          }
+        }
+        
         await client.destroy().catch(err => 
           log('error', `Error destroying client during memory cleanup: ${err.message}`)
         );
@@ -842,6 +1086,18 @@ setInterval(async () => {
     const hasValidPage = Boolean(client.pupPage);
     if (!hasValidPage) {
       log('warn', '⚠️ Watchdog: client missing pupPage. Restarting...');
+      
+      // Try to save session before restart
+      if (client.authStrategy) {
+        try {
+          log('info', '📥 Saving session before pupPage-triggered restart');
+          await client.authStrategy.save();
+          log('info', '📥 Session saved before pupPage-triggered restart');
+        } catch (err) {
+          log('error', `Failed to save session before pupPage-triggered restart: ${err.message}`);
+        }
+      }
+      
       await client.destroy().catch(err => 
         log('error', `Error destroying client in watchdog: ${err.message}`)
       );
@@ -852,6 +1108,18 @@ setInterval(async () => {
 
     if (state !== 'CONNECTED') {
       log('warn', `⚠️ Watchdog detected bad state "${state}". Restarting client...`);
+      
+      // Try to save session before restart
+      if (client.authStrategy && state !== null) {
+        try {
+          log('info', '📥 Saving session before state-triggered restart');
+          await client.authStrategy.save();
+          log('info', '📥 Session saved before state-triggered restart');
+        } catch (err) {
+          log('error', `Failed to save session before state-triggered restart: ${err.message}`);
+        }
+      }
+      
       await client.destroy().catch(err => 
         log('error', `Error destroying client in watchdog: ${err.message}`)
       );
