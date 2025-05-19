@@ -4,12 +4,12 @@ const qrcode = require('qrcode-terminal');
 const express = require('express');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
-const { Client, RemoteAuth, MessageMedia } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 
 // --- Config ---
 const PORT = process.env.PORT || 10000; // Using 10000 to match Render
 const SESSION_ID = process.env.WHATSAPP_SESSION_ID || 'default_session';
-const BOT_VERSION = '1.0.3'; 
+const BOT_VERSION = '1.0.4'; // Increment version
 const startedAt = Date.now();
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -19,12 +19,48 @@ const RECONNECT_DELAY = parseInt(process.env.RECONNECT_DELAY || '10000');
 const WATCHDOG_INTERVAL = parseInt(process.env.WATCHDOG_INTERVAL || '300000'); // 5 minutes
 const DEBUG_SESSION = true; // Enable session debugging
 
+// Add session state machine
+const SESSION_STATES = {
+  INITIALIZING: 'initializing',
+  WAITING_FOR_QR: 'waiting_for_qr',
+  AUTHENTICATED: 'authenticated',
+  CONNECTED: 'connected',
+  DISCONNECTED: 'disconnected',
+  FAILED: 'failed'
+};
+
+let sessionState = SESSION_STATES.INITIALIZING;
+let isBusinessAccount = false;
+
+function updateSessionState(newState, details = {}) {
+  log('info', `Session state: ${sessionState} → ${newState}`);
+  sessionState = newState;
+  
+  // Take actions based on state transitions
+  if (newState === SESSION_STATES.AUTHENTICATED) {
+    // Force immediate session save on authentication
+    setTimeout(() => safelyTriggerSessionSave(client), 2000);
+  }
+  
+  if (newState === SESSION_STATES.DISCONNECTED) {
+    // Try to save session before disconnect
+    safelyTriggerSessionSave(client).catch(err => 
+      log('error', `Failed to save session on disconnect: ${err.message}`)
+    );
+  }
+}
+
 async function safelyTriggerSessionSave(client) {
   if (!client) return false;
   
   try {
-    // Use the undocumented but working method to request a session save
-    if (client.authStrategy && typeof client.authStrategy.requestSave === 'function') {
+    // For enhanced LocalAuth, use the save method directly
+    if (client.authStrategy && typeof client.authStrategy.save === 'function') {
+      await client.authStrategy.save(client.authStrategy.authState);
+      log('info', '📥 Session save triggered');
+      return true;
+    } else if (client.authStrategy && typeof client.authStrategy.requestSave === 'function') {
+      // For RemoteAuth fallback
       await client.authStrategy.requestSave();
       log('info', '📥 Session save requested');
       return true;
@@ -70,14 +106,15 @@ log.debug = (message, ...args) => {
   console.log(formatted, ...args);
 };
 
-// --- Supabase Store with improved error handling and debugging ---
-class SupabaseStore {
-  constructor(supabaseClient, sessionId) {
-    this.supabase = supabaseClient;
-    this.sessionId = sessionId;
+// --- Enhanced LocalAuth with Supabase Integration ---
+class EnhancedLocalAuth extends LocalAuth {
+  constructor(options = {}) {
+    super(options);
+    this.supabase = options.supabase;
+    this.sessionId = options.sessionId || 'default';
     this.retryCount = 0;
     this.maxRetries = 3;
-    log('info', `SupabaseStore initialized for session ID: ${this.sessionId}`);
+    log('info', `EnhancedLocalAuth initialized for session ID: ${this.sessionId}`);
   }
 
   async _executeWithRetry(operation, fallback = null) {
@@ -98,109 +135,166 @@ class SupabaseStore {
     }
   }
 
-  async sessionExists({ session }) {
-    return this._executeWithRetry(async () => {
-      const { count, error } = await this.supabase
-        .from('whatsapp_sessions')
-        .select('*', { count: 'exact', head: true })
-        .eq('session_key', session);
-
-      if (error) throw new Error(`Supabase error in sessionExists: ${error.message}`);
-      
-      if (DEBUG_SESSION) {
-        log('info', `Session exists check: ${count > 0 ? 'found' : 'not found'}`);
-      }
-      
-      return count > 0;
-    }, false);
-  }
-
-  async extract() {
-    return this._executeWithRetry(async () => {
+  async afterInit(client) {
+    await super.afterInit(client);
+    
+    try {
+      // Try to load session from Supabase first
       const { data, error } = await this.supabase
         .from('whatsapp_sessions')
         .select('session_data')
         .eq('session_key', this.sessionId)
-        .limit(1)
         .single();
-
-      if (error) throw new Error(`Failed to extract session: ${error.message}`);
       
-      if (DEBUG_SESSION) {
-        log('info', `Session extracted, data ${data?.session_data ? 'present' : 'not present'}`);
-        if (data?.session_data) {
-          const sessionSize = JSON.stringify(data.session_data).length;
-          log('info', `Extracted session data size: ${sessionSize} bytes`);
-          
-          // Check if session data is valid (at least 100 bytes)
-          if (sessionSize < 100) {
-            log('warn', `Session data too small (${sessionSize} bytes), treating as invalid`);
-            return null; // Return null to force new QR code
+      if (error) {
+        log('warn', `Failed to query session from Supabase: ${error.message}`);
+        return;
+      }
+      
+      if (data?.session_data) {
+        // Check if session data is valid
+        const sessionSize = JSON.stringify(data.session_data).length;
+        if (sessionSize < 100) {
+          log('warn', `Session data too small (${sessionSize} bytes), might be invalid`);
+          return;
+        }
+        
+        log('info', `Found session in Supabase (${sessionSize} bytes)`);
+        
+        // Save to local storage
+        try {
+          const sessionDir = path.join(this.dataPath, 'session-' + this.sessionId);
+          if (!fs.existsSync(sessionDir)) {
+            fs.mkdirSync(sessionDir, { recursive: true });
           }
+          
+          await fs.promises.writeFile(
+            path.join(sessionDir, 'session.json'),
+            JSON.stringify(data.session_data),
+            { encoding: 'utf8' }
+          );
+          log('info', '✅ Session restored from Supabase to local storage');
+        } catch (writeErr) {
+          log('error', `Failed to write session to local storage: ${writeErr.message}`);
         }
       }
-      
-      return data?.session_data || null;
-    }, null);
+    } catch (err) {
+      log('warn', `Failed to restore session from Supabase: ${err.message}`);
+    }
   }
-
-  async save(sessionData) {
-    if (DEBUG_SESSION) {
-      const sessionSize = JSON.stringify(sessionData).length;
-      log('info', `Saving session data to Supabase (${sessionSize} bytes)`);
+  
+  async save(session) {
+    if (!session) {
+      log('warn', '⚠️ Attempting to save empty session');
+      return;
     }
     
-    return this._executeWithRetry(async () => {
-      const { error } = await this.supabase
-        .from('whatsapp_sessions')
-        .upsert({ 
-          session_key: this.sessionId, 
-          session_data: sessionData
-        }, { onConflict: 'session_key' });
-
-      if (error) throw new Error(`Failed to save session: ${error.message}`);
+    // First save locally using the parent method
+    try {
+      await super.save(session);
+    } catch (err) {
+      log('error', `Failed to save session locally: ${err.message}`);
+      // Continue anyway to try Supabase save
+    }
+    
+    // Then save to Supabase
+    try {
+      const sessionSize = JSON.stringify(session).length;
+      log('info', `Saving session to Supabase (${sessionSize} bytes)`);
       
-      if (DEBUG_SESSION) {
-        log('info', `Session saved successfully`);
+      if (sessionSize < 100) {
+        log('warn', `Session appears too small (${sessionSize} bytes), might be invalid`);
+        // Save anyway but log the warning
       }
       
-      return true;
-    }, false);
+      const { error } = await this.supabase
+        .from('whatsapp_sessions')
+        .upsert({
+          session_key: this.sessionId,
+          session_data: session,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'session_key' });
+      
+      if (error) throw new Error(error.message);
+      log('info', '✅ Session saved to Supabase');
+      
+      // Also create a backup copy
+      await this.supabase
+        .from('whatsapp_sessions')
+        .upsert({
+          session_key: `${this.sessionId}_backup`,
+          session_data: session,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'session_key' });
+      
+      log('info', '📥 Created session backup');
+    } catch (err) {
+      log('error', `⚠️ Failed to save session to Supabase: ${err.message}`);
+    }
   }
 
   async delete() {
-    return this._executeWithRetry(async () => {
-      // First, try to check if session actually exists
-      const exists = await this.sessionExists({ session: this.sessionId });
-      
-      if (!exists) {
-        log('info', 'No session to delete');
-        return true;
-      }
-      
+    // Delete from Supabase
+    try {
       const { error } = await this.supabase
         .from('whatsapp_sessions')
         .delete()
         .eq('session_key', this.sessionId);
-
-      if (error) throw new Error(`Failed to delete session: ${error.message}`);
       
-      if (DEBUG_SESSION) {
-        log('info', `Session deleted successfully`);
+      if (error) {
+        log('error', `Failed to delete session from Supabase: ${error.message}`);
+      } else {
+        log('info', '✅ Session deleted from Supabase');
       }
       
-      return true;
-    }, false);
+      // Also delete backup if it exists
+      await this.supabase
+        .from('whatsapp_sessions')
+        .delete()
+        .eq('session_key', `${this.sessionId}_backup`);
+    } catch (err) {
+      log('error', `Failed to delete session from Supabase: ${err.message}`);
+    }
+    
+    // Delete local session
+    return super.delete();
   }
 }
 
-const supabaseStore = new SupabaseStore(supabase, SESSION_ID);
 let client = null;
 let connectionRetryCount = 0;
 let isClientInitializing = false;
 let currentQRCode = null;
+let lastActivityTime = Date.now();
 
-// Improved WhatsApp client creation with better error handling
+// Function to detect if using a business number
+async function detectBusinessAccount(client) {
+  try {
+    // Try to access business profile (only available on business accounts)
+    const profile = await client.getBusinessProfile();
+    const isBusinessAcct = Boolean(profile && (profile.description || profile.email || profile.websites.length > 0));
+    log('info', `Account type: ${isBusinessAcct ? 'Business 💼' : 'Regular 👤'}`);
+    return isBusinessAcct;
+  } catch (err) {
+    log('warn', `Failed to detect account type: ${err.message}`);
+    return false;
+  }
+}
+
+// Apply specific optimizations for business accounts
+function applyBusinessOptimizations(client) {
+  log('info', '🔧 Applying business account optimizations...');
+  
+  // Shorter keepalive intervals for business accounts
+  if (client.options && client.options.webVersionCache) {
+    client.options.webVersionCache.checkInterval = 15000; // 15 seconds
+  }
+  
+  // Other business-specific optimizations here if needed
+  log('info', '✅ Applied business account optimizations');
+}
+
+// Optimized WhatsApp client creation
 function createWhatsAppClient() {
   const sessionPath = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
   const parentDir = path.dirname(sessionPath);
@@ -217,9 +311,9 @@ function createWhatsAppClient() {
   }
 
   return new Client({
-    authStrategy: new RemoteAuth({
-      store: supabaseStore,
-      backupSyncIntervalMs: 60000, // Fixed: Must be at least 60000 (1 minute)
+    authStrategy: new EnhancedLocalAuth({
+      supabase: supabase,
+      sessionId: SESSION_ID,
       dataPath: sessionPath,
     }),
     puppeteer: {
@@ -234,13 +328,14 @@ function createWhatsAppClient() {
         '--single-process',
         '--disable-gpu',
         '--disable-extensions',
+        '--window-size=1280,720', // Larger viewport helps with business number UI
         '--disable-features=site-per-process',
-        '--js-flags="--max-old-space-size=256"', // Reduced memory limit
+        '--js-flags="--max-old-space-size=300"', // Limit memory usage
         '--disable-web-security',
         '--disable-features=IsolateOrigins,site-per-process',
         '--disable-site-isolation-trials',
       ],
-      defaultViewport: { width: 800, height: 600 },
+      defaultViewport: null, // Allow responsive viewport
       timeout: 120000, // 2 minute timeout for browser launch
       protocolTimeout: 60000, // Protocol timeout to reduce errors
     },
@@ -251,17 +346,52 @@ function createWhatsAppClient() {
     qrTimeout: 0, // Never timeout waiting for QR
     restartOnAuthFail: true,
     takeoverOnConflict: true,
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36', // Updated Chrome UA
     multiDevice: true, // Enable multi-device beta for better session persistence
   });
 }
 
+// Handle Render sleep detection and preparation
+async function handleRenderSleep() {
+  log('info', '💤 Preparing for potential Render sleep...');
+  
+  // Try to save session before sleep
+  if (client && client.authStrategy) {
+    try {
+      await safelyTriggerSessionSave(client);
+      log('info', '📥 Session saved before potential sleep');
+    } catch (err) {
+      log('error', `Failed to save session before sleep: ${err.message}`);
+    }
+  }
+}
+
 // Function to clear existing invalid session
 async function clearInvalidSession() {
-  log('info', '🧹 Clearing invalid session from Supabase...');
+  log('info', '🧹 Clearing invalid session...');
   try {
-    await supabaseStore.delete();
-    log('info', '🧹 Invalid session cleared successfully');
+    if (client && client.authStrategy) {
+      await client.authStrategy.delete();
+      log('info', '🧹 Session cleared via auth strategy');
+    } else {
+      // Fallback to manual deletion
+      const { error } = await supabase
+        .from('whatsapp_sessions')
+        .delete()
+        .eq('session_key', SESSION_ID);
+        
+      if (error) {
+        log('error', `Failed to delete session from Supabase: ${error.message}`);
+      } else {
+        log('info', '🧹 Session deleted from Supabase');
+      }
+      
+      // Also delete backup if it exists
+      await supabase
+        .from('whatsapp_sessions')
+        .delete()
+        .eq('session_key', `${SESSION_ID}_backup`);
+    }
     
     // Also clear local session files
     const sessionPath = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
@@ -283,6 +413,9 @@ async function clearInvalidSession() {
 
 function setupClientEvents(c) {
   c.on('qr', qr => {
+    // Update session state
+    updateSessionState(SESSION_STATES.WAITING_FOR_QR);
+    
     // Log QR code URL for scanning (this is what you need)
     const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qr)}&size=300x300`;
     log('warn', `📱 Scan QR Code: ${qrUrl}`);
@@ -294,10 +427,21 @@ function setupClientEvents(c) {
     connectionRetryCount = 0;
   });
 
-  c.on('ready', () => {
+  c.on('ready', async () => {
     log('info', '✅ WhatsApp client is ready.');
+    updateSessionState(SESSION_STATES.CONNECTED);
     connectionRetryCount = 0; // Reset retry count on successful connection
     currentQRCode = null; // Clear QR code on ready
+    
+    // Check if this is a business account and apply optimizations
+    try {
+      isBusinessAccount = await detectBusinessAccount(c);
+      if (isBusinessAccount) {
+        applyBusinessOptimizations(c);
+      }
+    } catch (err) {
+      log('warn', `Failed to detect account type: ${err.message}`);
+    }
     
     // Force garbage collection if available
     if (global.gc) {
@@ -308,6 +452,7 @@ function setupClientEvents(c) {
 
   c.on('authenticated', () => {
     log('info', '🔐 Client authenticated.');
+    updateSessionState(SESSION_STATES.AUTHENTICATED);
     currentQRCode = null; // Clear QR code once authenticated
     
     // Try to save session immediately after authentication
@@ -321,22 +466,9 @@ function setupClientEvents(c) {
     }
   });
 
-  c.on('remote_session_saved', () => {
-    // Add more detailed session state logging
-    if (c.authStrategy?.authState) {
-      try {
-        const sessionSize = JSON.stringify(c.authStrategy.authState).length;
-        log('info', `💾 Session saved to Supabase (${sessionSize} bytes)`);
-      } catch (err) {
-        log('info', `💾 Session saved to Supabase (size unknown: ${err.message})`);
-      }
-    } else {
-      log('info', '💾 Session saved to Supabase.');
-    }
-  });
-
   c.on('disconnected', async reason => {
     log('warn', `Client disconnected: ${reason}`);
+    updateSessionState(SESSION_STATES.DISCONNECTED, { reason });
     currentQRCode = null;
     
     // Try to save session before disconnecting if possible
@@ -361,7 +493,7 @@ function setupClientEvents(c) {
     }
     
     connectionRetryCount++;
-    const delay = Math.min(RECONNECT_DELAY * connectionRetryCount, 5 * 60 * 1000); // Cap at 5 minutes
+    const delay = Math.min(RECONNECT_DELAY * Math.pow(1.5, Math.min(connectionRetryCount - 1, 5)), 5 * 60 * 1000); // Exponential backoff, cap at 5 minutes
     log('info', `Will try to reconnect in ${delay/1000} seconds (attempt ${connectionRetryCount})`);
     
     setTimeout(startClient, delay);
@@ -369,22 +501,11 @@ function setupClientEvents(c) {
 
   c.on('auth_failure', async msg => {
     log('error', `❌ Auth failed: ${msg}. Clearing session.`);
+    updateSessionState(SESSION_STATES.FAILED, { reason: msg });
     currentQRCode = null;
     
     // Clear the session data
-    try {
-      await supabaseStore.delete();
-      log('info', '🗑️ Session data deleted from Supabase');
-      
-      // Clear local session files
-      const sessionPath = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
-      if (fs.existsSync(sessionPath)) {
-        fs.rmSync(sessionPath, { recursive: true, force: true });
-        log('info', '🗑️ Local session files deleted');
-      }
-    } catch (err) {
-      log('error', `Failed to clear session data: ${err.message}`);
-    }
+    await clearInvalidSession();
     
     // Don't exit - instead try to restart the client after a delay
     if (client) {
@@ -414,6 +535,9 @@ function setupClientEvents(c) {
   c.on('change_state', state => {
     log('info', `Connection state changed to: ${state}`);
     
+    // Update activity time on state change
+    lastActivityTime = Date.now();
+    
     // Try to save session on state change
     if (state === 'CONNECTED' && c.authStrategy) {
       try {
@@ -429,7 +553,7 @@ function setupClientEvents(c) {
 let messageCount = 0;
 let lastMemoryCheck = 0;
 
-// Improved message handler with better error handling and verbose logging
+// Your existing message handler (preserved)
 async function handleIncomingMessage(msg) {
   try {
     // Basic validation
@@ -475,6 +599,9 @@ async function handleIncomingMessage(msg) {
       return;
     }
 
+    // Update activity time when processing messages
+    lastActivityTime = Date.now();
+
     // Memory usage tracking
     messageCount++;
     const now = Date.now();
@@ -519,7 +646,7 @@ async function handleIncomingMessage(msg) {
   }
 }
 
-// Improved webhook sender with better retry logic and timeout handling
+// Improved webhook sender (preserved from your original code)
 async function sendToN8nWebhook(payload, attempt = 0) {
   if (!N8N_WEBHOOK_URL) {
     log('warn', '⚠️ N8N_WEBHOOK_URL not set. Webhook skipped.');
@@ -596,6 +723,36 @@ async function checkSessionStatus() {
     
     if (!data) {
       log('info', '❓ No session found in Supabase');
+      
+      // Check for backup session
+      const { data: backupData, error: backupError } = await supabase
+        .from('whatsapp_sessions')
+        .select('*')
+        .eq('session_key', `${SESSION_ID}_backup`)
+        .limit(1)
+        .single();
+        
+      if (!backupError && backupData) {
+        log('info', '🔄 Found backup session, restoring...');
+        
+        // Restore from backup
+        const { error: restoreError } = await supabase
+          .from('whatsapp_sessions')
+          .upsert({
+            session_key: SESSION_ID,
+            session_data: backupData.session_data,
+            updated_at: new Date().toISOString()
+          }, { onConflict: 'session_key' });
+          
+        if (restoreError) {
+          log('error', `Failed to restore from backup: ${restoreError.message}`);
+          return false;
+        }
+        
+        log('info', '✅ Session restored from backup');
+        return true;
+      }
+      
       return false;
     }
     
@@ -630,6 +787,7 @@ async function startClient() {
 
   isClientInitializing = true;
   currentQRCode = null;
+  updateSessionState(SESSION_STATES.INITIALIZING);
   
   try {
     // Check if we have a valid session before starting
@@ -645,6 +803,9 @@ async function startClient() {
     await client.initialize();
     log('info', '✅ WhatsApp client initialized.');
     
+    // Reset activity time on successful initialization
+    lastActivityTime = Date.now();
+    
     // Try to force save session right after successful initialization
     if (client.authStrategy?.authState) {
       try {
@@ -657,6 +818,7 @@ async function startClient() {
     }
   } catch (err) {
     log('error', `❌ WhatsApp client failed to initialize: ${err.message}`);
+    updateSessionState(SESSION_STATES.FAILED, { reason: err.message });
     
     if (client) {
       try {
@@ -670,7 +832,7 @@ async function startClient() {
     
     // Try again after a delay with exponential backoff
     connectionRetryCount++;
-    const delay = Math.min(RECONNECT_DELAY * Math.pow(2, Math.min(connectionRetryCount - 1, 5)), 10 * 60 * 1000); // Cap at 10 minutes
+    const delay = Math.min(RECONNECT_DELAY * Math.pow(1.5, Math.min(connectionRetryCount - 1, 5)), 10 * 60 * 1000); // Cap at 10 minutes
     log('info', `Will try to initialize again in ${delay/1000} seconds (attempt ${connectionRetryCount})`);
     setTimeout(startClient, delay);
   } finally {
@@ -687,6 +849,10 @@ app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('X-XSS-Protection', '1; mode=block');
+  
+  // Update activity timestamp to detect Render sleep
+  lastActivityTime = Date.now();
+  
   next();
 });
 
@@ -740,6 +906,8 @@ app.get('/', (_, res) => {
     status: client ? '✅ Bot running' : '⚠️ Bot initializing',
     sessionId: SESSION_ID,
     version: BOT_VERSION,
+    accountType: isBusinessAccount ? 'Business' : 'Regular',
+    sessionState: sessionState,
     uptimeMinutes: Math.floor(uptime / 60000),
     uptimeHours: Math.floor(uptime / 3600000),
     uptimeDays: Math.floor(uptime / 86400000),
@@ -817,7 +985,9 @@ app.get('/session', async (req, res) => {
     
     return res.status(200).json({
       hasSession,
+      sessionState: sessionState,
       clientState: client ? await client.getState() : 'not_initialized',
+      isBusinessAccount: isBusinessAccount,
       timestamp: new Date().toISOString()
     });
   } catch (err) {
@@ -827,7 +997,7 @@ app.get('/session', async (req, res) => {
   }
 });
 
-// Message sending endpoint - no API key required as requested
+// Message sending endpoint (preserved from your original code)
 app.post('/send-message', async (req, res) => {
   const { jid, message, imageUrl } = req.body;
 
@@ -880,6 +1050,10 @@ app.post('/send-message', async (req, res) => {
 
     // Send plain text message
     const sentMessage = await client.sendMessage(jid, message);
+    
+    // Update activity time
+    lastActivityTime = Date.now();
+    
     return res.status(200).json({ 
       success: true, 
       messageId: sentMessage.id.id,
@@ -902,6 +1076,10 @@ app.get('/test-message/:jid', async (req, res) => {
   try {
     const sentMessage = await client.sendMessage(jid, 'This is a test message from the WhatsApp bot');
     log('info', `Test message sent to ${jid}`);
+    
+    // Update activity time
+    lastActivityTime = Date.now();
+    
     return res.status(200).json({ 
       success: true, 
       messageId: sentMessage.id.id,
@@ -913,13 +1091,14 @@ app.get('/test-message/:jid', async (req, res) => {
   }
 });
 
-// Get client status endpoint
+// Get client status endpoint (enhanced)
 app.get('/status', async (req, res) => {
   try {
     if (!client) {
       return res.status(503).json({ 
         status: 'offline',
-        error: 'Client not initialized'
+        error: 'Client not initialized',
+        sessionState: sessionState
       });
     }
     
@@ -930,11 +1109,17 @@ app.get('/status', async (req, res) => {
     // Check session status
     const sessionStatus = await checkSessionStatus();
     
+    // Calculate time since last activity
+    const inactiveTime = Math.floor((Date.now() - lastActivityTime) / 1000);
+    
     return res.status(200).json({
       status: state,
+      sessionState: sessionState,
       connectionState,
       connectionRetries: connectionRetryCount,
       uptime: Math.floor((Date.now() - startedAt) / 1000),
+      inactiveSeconds: inactiveTime,
+      isBusinessAccount: isBusinessAccount,
       memory: {
         rss: Math.round(mem.rss / 1024 / 1024),
         heapTotal: Math.round(mem.heapTotal / 1024 / 1024),
@@ -950,7 +1135,8 @@ app.get('/status', async (req, res) => {
     log('error', `Status check error: ${err.message}`);
     return res.status(500).json({ 
       status: 'error',
-      error: err.message
+      error: err.message,
+      sessionState: sessionState
     });
   }
 });
@@ -1019,6 +1205,16 @@ app.post('/restart', async (req, res) => {
   setTimeout(startClient, 2000);
 });
 
+// Render sleep detection endpoint
+app.post('/prepare-sleep', async (req, res) => {
+  res.status(202).json({
+    success: true,
+    message: 'Preparing for sleep'
+  });
+  
+  await handleRenderSleep();
+});
+
 // Start server and initialize client
 app.listen(PORT, () => {
   log('info', `🚀 Server started on http://localhost:${PORT}`);
@@ -1039,13 +1235,29 @@ app.listen(PORT, () => {
     log.debug('🏓 Self-ping successful');
   }, 60000); // Every minute
   
+  // Add Render sleep detection - check for inactivity
+  setInterval(() => {
+    const inactiveTime = Date.now() - lastActivityTime;
+    
+    // If inactive for 10+ minutes, prepare for potential sleep
+    if (inactiveTime > 10 * 60 * 1000) {
+      log('warn', `⚠️ Detected ${Math.round(inactiveTime/60000)}min inactivity, preparing for potential sleep`);
+      handleRenderSleep().catch(err => 
+        log('error', `Failed during sleep preparation: ${err.message}`)
+      );
+    }
+  }, 5 * 60 * 1000); // Check every 5 minutes
+  
   // Additional interval to force session saves periodically
   setInterval(async () => {
-    if (client && client.authStrategy && client.getState && await client.getState() === 'CONNECTED') {
+    if (client && client.authStrategy && client.getState) {
       try {
-        log('info', '📥 Periodic session save triggered');
-        await safelyTriggerSessionSave(client);
-        log('info', '📥 Periodic session save completed');
+        const state = await client.getState();
+        if (state === 'CONNECTED') {
+          log('info', '📥 Periodic session save triggered');
+          await safelyTriggerSessionSave(client);
+          log('info', '📥 Periodic session save completed');
+        }
       } catch (err) {
         log('error', `Failed to perform periodic session save: ${err.message}`);
       }
