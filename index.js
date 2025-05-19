@@ -18,6 +18,7 @@ const MEMORY_THRESHOLD_MB = parseInt(process.env.MEMORY_THRESHOLD_MB || '450');
 const RECONNECT_DELAY = parseInt(process.env.RECONNECT_DELAY || '10000');
 const WATCHDOG_INTERVAL = parseInt(process.env.WATCHDOG_INTERVAL || '300000'); // 5 minutes
 const DEBUG_SESSION = true; // Enable session debugging
+let MAX_MESSAGES_PER_HOUR = 90; // Default, can be changed for business accounts
 
 // Add session state machine
 const SESSION_STATES = {
@@ -289,6 +290,10 @@ function applyBusinessOptimizations(client) {
   if (client.options && client.options.webVersionCache) {
     client.options.webVersionCache.checkInterval = 15000; // 15 seconds
   }
+  
+  // Different message sending behavior for business accounts
+  // Business accounts need more conservative sending patterns
+  MAX_MESSAGES_PER_HOUR = 70; // Lower limit for business accounts
   
   // Other business-specific optimizations here if needed
   log('info', '✅ Applied business account optimizations');
@@ -908,6 +913,11 @@ app.get('/', (_, res) => {
     version: BOT_VERSION,
     accountType: isBusinessAccount ? 'Business' : 'Regular',
     sessionState: sessionState,
+    queue: {
+      length: messageQueue.length,
+      sentThisHour: messagesSentLastHour,
+      limit: MAX_MESSAGES_PER_HOUR
+    },
     uptimeMinutes: Math.floor(uptime / 60000),
     uptimeHours: Math.floor(uptime / 3600000),
     uptimeDays: Math.floor(uptime / 86400000),
@@ -997,9 +1007,128 @@ app.get('/session', async (req, res) => {
   }
 });
 
-// Message sending endpoint (preserved from your original code)
+// Message queue to prevent rate limiting and add human-like behavior
+const messageQueue = [];
+let isProcessingQueue = false;
+let messagesSentLastHour = 0;
+let lastHourReset = Date.now();
+const MAX_MESSAGES_PER_HOUR = 90; // Keeping below 100/hour limit
+const QUEUE_CHECK_INTERVAL = 2000; // Check queue every 2 seconds
+
+// Process message queue with human-like delays
+async function processMessageQueue() {
+  if (isProcessingQueue || messageQueue.length === 0) return;
+  
+  // Check hourly message limit
+  const now = Date.now();
+  if (now - lastHourReset > 60 * 60 * 1000) {
+    // Reset counter after an hour
+    messagesSentLastHour = 0;
+    lastHourReset = now;
+  }
+  
+  // Stop if we've hit the hourly limit
+  if (messagesSentLastHour >= MAX_MESSAGES_PER_HOUR) {
+    log('warn', `⚠️ Hourly message limit reached (${messagesSentLastHour}/${MAX_MESSAGES_PER_HOUR}). Queue paused.`);
+    return;
+  }
+  
+  isProcessingQueue = true;
+  
+  try {
+    const task = messageQueue.shift();
+    const { jid, message, imageUrl, options = {}, callback } = task;
+    
+    // Add human-like random delay (500-2500ms)
+    const delay = 500 + Math.floor(Math.random() * 2000);
+    log('info', `🕒 Adding human-like delay of ${delay}ms before sending message`);
+    await new Promise(resolve => setTimeout(resolve, delay));
+    
+    if (!client || !client.pupPage) {
+      log('error', 'Client not ready when processing queue');
+      messageQueue.unshift(task); // Put the task back at the front
+      return callback({ success: false, error: 'WhatsApp client not ready' });
+    }
+    
+    let sentMessage;
+    
+    if (imageUrl) {
+      try {
+        const media = await MessageMedia.fromUrl(imageUrl, { 
+          unsafeMime: false,
+          reqOptions: {
+            timeout: 15000,
+            headers: {
+              'User-Agent': `WhatsAppBot/${BOT_VERSION}`
+            }
+          }
+        });
+        
+        sentMessage = await client.sendMessage(jid, media, {
+          caption: message || '',
+          ...options
+        });
+      } catch (mediaErr) {
+        log('error', `Failed to process media: ${mediaErr.message}`);
+        return callback({ success: false, error: `Failed to process media: ${mediaErr.message}` });
+      }
+    } else {
+      // Random typing delay for text messages to appear more human-like
+      try {
+        // Simulate "typing..." for a random duration based on message length
+        const typingTime = Math.min(
+          1000 + (message.length * 20), 
+          7000 // Cap at 7 seconds for very long messages
+        );
+        log('info', `🖊️ Simulating typing for ${Math.round(typingTime/1000)}s`);
+        
+        await client.sendMessage(jid, { isTyping: true });
+        await new Promise(resolve => setTimeout(resolve, typingTime));
+        await client.sendMessage(jid, { isTyping: false });
+        
+        // Send the actual message
+        sentMessage = await client.sendMessage(jid, message, options);
+      } catch (err) {
+        // If typing simulation fails, just send the message
+        log('warn', `Typing simulation failed: ${err.message}`);
+        sentMessage = await client.sendMessage(jid, message, options);
+      }
+    }
+    
+    // Update activity time
+    lastActivityTime = Date.now();
+    messagesSentLastHour++;
+    
+    log('info', `✉️ Message sent from queue (${messagesSentLastHour}/${MAX_MESSAGES_PER_HOUR} this hour, ${messageQueue.length} remaining)`);
+    
+    callback({ 
+      success: true, 
+      messageId: sentMessage.id.id,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    log('error', `Error processing message from queue: ${err.message}`);
+    if (messageQueue.length > 0) {
+      const task = messageQueue[0];
+      task.callback({ success: false, error: err.message });
+      messageQueue.shift();
+    }
+  } finally {
+    isProcessingQueue = false;
+    
+    // Process next item after a small delay
+    if (messageQueue.length > 0) {
+      setTimeout(processMessageQueue, 1000);
+    }
+  }
+}
+
+// Start queue processor
+setInterval(processMessageQueue, QUEUE_CHECK_INTERVAL);
+
+// Enhanced message sending endpoint with queue
 app.post('/send-message', async (req, res) => {
-  const { jid, message, imageUrl } = req.body;
+  const { jid, message, imageUrl, options = {} } = req.body;
 
   if (!jid || (!message && !imageUrl)) {
     return res.status(400).json({ success: false, error: 'Missing jid or message/imageUrl' });
@@ -1008,64 +1137,61 @@ app.post('/send-message', async (req, res) => {
   if (!client) {
     return res.status(503).json({ success: false, error: 'WhatsApp client not ready' });
   }
-
-  try {
-    // Send media if imageUrl provided
-    if (imageUrl) {
-      // Validate URL to prevent request forgery
-      try {
-        new URL(imageUrl); // Will throw if invalid URL
-      } catch (err) {
-        return res.status(400).json({ success: false, error: 'Invalid imageUrl format' });
-      }
-      
-      try {
-        const media = await MessageMedia.fromUrl(imageUrl, { 
-          unsafeMime: false, // Safer option
-          reqOptions: {
-            timeout: 15000,  // 15 second timeout
-            headers: {
-              'User-Agent': `WhatsAppBot/${BOT_VERSION}`
-            }
-          }
-        });
-        
-        const sentMessage = await client.sendMessage(jid, media, {
-          caption: message || '',
-        });
-        
-        return res.status(200).json({ 
-          success: true, 
-          messageId: sentMessage.id.id,
-          timestamp: new Date().toISOString()
-        });
-      } catch (mediaErr) {
-        log('error', `Failed to process media: ${mediaErr.message}`);
-        return res.status(500).json({ 
-          success: false, 
-          error: `Failed to process media: ${mediaErr.message}`
-        });
-      }
+  
+  // Validate URL to prevent request forgery if imageUrl provided
+  if (imageUrl) {
+    try {
+      new URL(imageUrl); // Will throw if invalid URL
+    } catch (err) {
+      return res.status(400).json({ success: false, error: 'Invalid imageUrl format' });
     }
-
-    // Send plain text message
-    const sentMessage = await client.sendMessage(jid, message);
-    
-    // Update activity time
-    lastActivityTime = Date.now();
-    
-    return res.status(200).json({ 
-      success: true, 
-      messageId: sentMessage.id.id,
-      timestamp: new Date().toISOString()
-    });
-  } catch (err) {
-    log('error', `Error sending message: ${err.message}`);
-    return res.status(500).json({ success: false, error: err.message });
   }
+  
+  // Check if queue is getting too long
+  if (messageQueue.length >= 50) {
+    return res.status(429).json({ 
+      success: false, 
+      error: 'Message queue too long. Try again later.',
+      queueLength: messageQueue.length
+    });
+  }
+  
+  // Add message to queue
+  const taskId = `task_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  
+  log('info', `📨 Adding message to queue for ${jid} (queue length: ${messageQueue.length + 1})`);
+  
+  // Add to queue and respond immediately
+  messageQueue.push({
+    jid,
+    message,
+    imageUrl,
+    options,
+    taskId,
+    addedAt: Date.now(),
+    callback: (result) => {
+      // This will be called when the message is actually sent
+      log('info', `Task ${taskId} completed with result: ${result.success ? 'success' : 'failure'}`);
+    }
+  });
+  
+  // Start processing if not already running
+  if (!isProcessingQueue) {
+    processMessageQueue();
+  }
+  
+  // Respond immediately with task info
+  return res.status(202).json({
+    success: true,
+    message: 'Message added to queue',
+    queuePosition: messageQueue.length,
+    queueLength: messageQueue.length,
+    taskId,
+    estimated_send_time: `${(messageQueue.length * 2)} seconds`
+  });
 });
 
-// Test endpoint to verify bot is working
+// Test endpoint to verify bot is working with queue
 app.get('/test-message/:jid', async (req, res) => {
   const jid = req.params.jid;
   
@@ -1073,22 +1199,34 @@ app.get('/test-message/:jid', async (req, res) => {
     return res.status(503).json({ success: false, error: 'WhatsApp client not ready' });
   }
   
-  try {
-    const sentMessage = await client.sendMessage(jid, 'This is a test message from the WhatsApp bot');
-    log('info', `Test message sent to ${jid}`);
-    
-    // Update activity time
-    lastActivityTime = Date.now();
-    
-    return res.status(200).json({ 
-      success: true, 
-      messageId: sentMessage.id.id,
-      timestamp: new Date().toISOString()
-    });
-  } catch (err) {
-    log('error', `Error sending test message: ${err.message}`);
-    return res.status(500).json({ success: false, error: err.message });
+  // Add test message to queue instead of sending directly
+  const taskId = `test_${Date.now()}`;
+  
+  messageQueue.push({
+    jid,
+    message: 'This is a test message from the WhatsApp bot',
+    options: {},
+    taskId,
+    addedAt: Date.now(),
+    callback: (result) => {
+      log('info', `Test message to ${jid} ${result.success ? 'sent' : 'failed'}`);
+    }
+  });
+  
+  // Start processing if not already running
+  if (!isProcessingQueue) {
+    processMessageQueue();
   }
+  
+  log('info', `Test message queued for ${jid}`);
+  
+  // Respond immediately
+  return res.status(202).json({ 
+    success: true, 
+    message: 'Test message added to queue',
+    queuePosition: messageQueue.length,
+    taskId
+  });
 });
 
 // Get client status endpoint (enhanced)
@@ -1120,6 +1258,12 @@ app.get('/status', async (req, res) => {
       uptime: Math.floor((Date.now() - startedAt) / 1000),
       inactiveSeconds: inactiveTime,
       isBusinessAccount: isBusinessAccount,
+      messageQueue: {
+        length: messageQueue.length,
+        processing: isProcessingQueue,
+        sentThisHour: messagesSentLastHour,
+        hourlyLimit: MAX_MESSAGES_PER_HOUR
+      },
       memory: {
         rss: Math.round(mem.rss / 1024 / 1024),
         heapTotal: Math.round(mem.heapTotal / 1024 / 1024),
@@ -1188,6 +1332,14 @@ app.post('/restart', async (req, res) => {
     }
   }
   
+  // Clear message queue
+  const queueLength = messageQueue.length;
+  if (queueLength > 0) {
+    log('info', `Clearing message queue (${queueLength} items)`);
+    messageQueue.length = 0;
+    isProcessingQueue = false;
+  }
+  
   // Destroy and restart client
   if (client) {
     try {
@@ -1198,6 +1350,7 @@ app.post('/restart', async (req, res) => {
       client = null;
       // Reset counters on manual restart
       connectionRetryCount = 0; 
+      messagesSentLastHour = 0;
     }
   }
   
@@ -1205,14 +1358,35 @@ app.post('/restart', async (req, res) => {
   setTimeout(startClient, 2000);
 });
 
-// Render sleep detection endpoint
-app.post('/prepare-sleep', async (req, res) => {
-  res.status(202).json({
-    success: true,
-    message: 'Preparing for sleep'
+// Queue management endpoints
+app.get('/queue', (req, res) => {
+  res.status(200).json({
+    queue_length: messageQueue.length,
+    is_processing: isProcessingQueue,
+    sent_this_hour: messagesSentLastHour,
+    hourly_limit: MAX_MESSAGES_PER_HOUR,
+    time_until_reset: lastHourReset + (60 * 60 * 1000) - Date.now(),
+    queue_preview: messageQueue.slice(0, 5).map(item => ({
+      taskId: item.taskId,
+      jid: item.jid,
+      added_at: new Date(item.addedAt).toISOString(),
+      message_preview: item.message ? 
+        (item.message.length > 30 ? item.message.substring(0, 30) + '...' : item.message) : 
+        (item.imageUrl ? '[IMAGE]' : '[UNKNOWN]')
+    }))
   });
+});
+
+// Clear queue endpoint
+app.post('/queue/clear', (req, res) => {
+  const queueLength = messageQueue.length;
+  messageQueue.length = 0;
+  isProcessingQueue = false;
   
-  await handleRenderSleep();
+  res.status(200).json({
+    success: true,
+    message: `Queue cleared (${queueLength} items removed)`
+  });
 });
 
 // Start server and initialize client
