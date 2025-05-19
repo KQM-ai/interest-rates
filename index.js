@@ -7,9 +7,9 @@ const { createClient } = require('@supabase/supabase-js');
 const { Client, RemoteAuth, MessageMedia } = require('whatsapp-web.js');
 
 // --- Config ---
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000; // Using 10000 to match Render
 const SESSION_ID = process.env.WHATSAPP_SESSION_ID || 'default_session';
-const BOT_VERSION = '1.0.3'; // Updated version
+const BOT_VERSION = '1.0.3'; 
 const startedAt = Date.now();
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -112,6 +112,12 @@ class SupabaseStore {
         if (data?.session_data) {
           const sessionSize = JSON.stringify(data.session_data).length;
           log('info', `Extracted session data size: ${sessionSize} bytes`);
+          
+          // Check if session data is valid (at least 100 bytes)
+          if (sessionSize < 100) {
+            log('warn', `Session data too small (${sessionSize} bytes), treating as invalid`);
+            return null; // Return null to force new QR code
+          }
         }
       }
       
@@ -145,6 +151,14 @@ class SupabaseStore {
 
   async delete() {
     return this._executeWithRetry(async () => {
+      // First, try to check if session actually exists
+      const exists = await this.sessionExists({ session: this.sessionId });
+      
+      if (!exists) {
+        log('info', 'No session to delete');
+        return true;
+      }
+      
       const { error } = await this.supabase
         .from('whatsapp_sessions')
         .delete()
@@ -186,7 +200,7 @@ function createWhatsAppClient() {
   return new Client({
     authStrategy: new RemoteAuth({
       store: supabaseStore,
-      backupSyncIntervalMs: 30000, // Reduced from 300000 to 30000 (30 seconds) for more frequent saves
+      backupSyncIntervalMs: 60000, // Fixed: Must be at least 60000 (1 minute)
       dataPath: sessionPath,
     }),
     puppeteer: {
@@ -221,6 +235,31 @@ function createWhatsAppClient() {
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
     multiDevice: true, // Enable multi-device beta for better session persistence
   });
+}
+
+// Function to clear existing invalid session
+async function clearInvalidSession() {
+  log('info', '🧹 Clearing invalid session from Supabase...');
+  try {
+    await supabaseStore.delete();
+    log('info', '🧹 Invalid session cleared successfully');
+    
+    // Also clear local session files
+    const sessionPath = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
+    if (fs.existsSync(sessionPath)) {
+      try {
+        fs.rmSync(sessionPath, { recursive: true, force: true });
+        log('info', '🧹 Local session files cleared');
+      } catch (err) {
+        log('error', `Failed to clear local session files: ${err.message}`);
+      }
+    }
+    
+    return true;
+  } catch (err) {
+    log('error', `Failed to clear invalid session: ${err.message}`);
+    return false;
+  }
 }
 
 function setupClientEvents(c) {
@@ -544,8 +583,10 @@ async function checkSessionStatus() {
     const sessionDataSize = JSON.stringify(data.session_data).length;
     log('info', `✅ Found session in Supabase (${sessionDataSize} bytes)`);
     
+    // Session data less than 100 bytes is almost certainly invalid
     if (sessionDataSize < 100) {
       log('warn', '⚠️ Session data appears to be too small, might be invalid');
+      await clearInvalidSession();
       return false;
     }
     
@@ -573,7 +614,10 @@ async function startClient() {
   
   try {
     // Check if we have a valid session before starting
-    await checkSessionStatus();
+    const hasValidSession = await checkSessionStatus();
+    if (!hasValidSession) {
+      log('info', '🔄 No valid session found, starting fresh authentication');
+    }
     
     log('info', '🚀 Starting WhatsApp client...');
     client = createWhatsAppClient();
@@ -715,6 +759,36 @@ app.get('/qr', (req, res) => {
     </body>
     </html>
   `);
+});
+
+// Delete session endpoint to manually clear an invalid session
+app.post('/delete-session', async (req, res) => {
+  try {
+    await clearInvalidSession();
+    
+    res.status(200).json({
+      success: true,
+      message: 'Session deleted successfully'
+    });
+    
+    // Restart client after session deletion
+    if (client) {
+      try {
+        await client.destroy();
+      } catch (err) {
+        log('error', `Error destroying client after session deletion: ${err.message}`);
+      } finally {
+        client = null;
+      }
+    }
+    
+    setTimeout(startClient, 2000);
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
 });
 
 // Session check endpoint
@@ -931,8 +1005,15 @@ app.listen(PORT, () => {
   log('info', `🚀 Server started on http://localhost:${PORT}`);
   log('info', `🤖 Bot Version: ${BOT_VERSION}`);
   
-  // Start WhatsApp client
-  startClient();
+  // Check if session is valid first, and delete if not
+  checkSessionStatus().then(hasValidSession => {
+    if (!hasValidSession) {
+      log('warn', '⚠️ Invalid or missing session detected. Will ask for QR code on startup.');
+    }
+    
+    // Start WhatsApp client
+    startClient();
+  });
   
   // Setup self-ping to match desired log format
   setInterval(() => {
