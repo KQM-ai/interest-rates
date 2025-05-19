@@ -1,24 +1,4 @@
-// Public health check endpoint
-app.get('/', (_, res) => {
-  const uptime = Date.now() - startedAt;
-  res.status(200).json({
-    status: client ? '✅ Bot running' : '⚠️ Bot initializing',
-    sessionId: SESSION_ID,
-    version: BOT_VERSION,
-    accountType: isBusinessAccount ? 'Business' : 'Regular',
-    sessionState: sessionState,
-    queue: {
-      length: messageQueue.length,
-      sentThisHour: messagesSentLastHour,
-      limit: MAX_MESSAGES_PER_HOUR
-    },
-    uptimeMinutes: Math.floor(uptime / 60000),
-    uptimeHours: Math.floor(uptime / 3600000),
-    uptimeDays: Math.floor(uptime / 86400000),
-    timestamp: new Date().toISOString(),
-    nodeVersion: process.version,
-  });
-});const fs = require('fs');
+const fs = require('fs');
 const path = require('path');
 const qrcode = require('qrcode-terminal');
 const express = require('express');
@@ -865,156 +845,6 @@ async function startClient() {
   }
 }
 
-// Enhanced Express server with basic security
-const app = express();
-
-// Security middleware
-app.use((req, res, next) => {
-  // Add security headers
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('X-XSS-Protection', '1; mode=block');
-  
-  // Update activity timestamp to detect Render sleep
-  lastActivityTime = Date.now();
-  
-  next();
-});
-
-// Basic rate limiting
-const requestCounts = new Map();
-const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX = 60; // 60 requests per minute
-
-app.use((req, res, next) => {
-  const ip = req.ip || req.socket.remoteAddress || 'unknown';
-  const now = Date.now();
-  
-  // Clean up old entries
-  if (requestCounts.size > 100) {
-    for (const [key, { timestamp }] of requestCounts.entries()) {
-      if (now - timestamp > RATE_LIMIT_WINDOW) {
-        requestCounts.delete(key);
-      }
-    }
-  }
-  
-  // Check rate limit
-  if (!requestCounts.has(ip)) {
-    requestCounts.set(ip, { count: 1, timestamp: now });
-  } else {
-    const record = requestCounts.get(ip);
-    if (now - record.timestamp > RATE_LIMIT_WINDOW) {
-      // Reset if window expired
-      record.count = 1;
-      record.timestamp = now;
-    } else {
-      record.count++;
-      if (record.count > RATE_LIMIT_MAX) {
-        return res.status(429).json({ 
-          error: 'Too many requests',
-          retry_after: Math.ceil((record.timestamp + RATE_LIMIT_WINDOW - now) / 1000)
-        });
-      }
-    }
-  }
-  
-  next();
-});
-
-app.use(express.json({ limit: '1mb' })); // Limit request body size
-
-// Render sleep detection endpoint
-app.post('/prepare-sleep', async (req, res) => {
-  res.status(202).json({
-    success: true,
-    message: 'Preparing for sleep'
-  });
-  
-  await handleRenderSleep();
-});
-
-// QR code access endpoint - access via browser to scan
-app.get('/qr', (req, res) => {
-  if (!currentQRCode) {
-    return res.status(404).send('No QR code available. The bot is either already authenticated or still initializing.');
-  }
-
-  // Generate QR code as HTML
-  res.setHeader('Content-Type', 'text/html');
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>WhatsApp QR Code</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <style>
-        body { font-family: Arial, sans-serif; text-align: center; margin: 20px; }
-        img { max-width: 100%; height: auto; }
-        .container { max-width: 500px; margin: 0 auto; }
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <h1>WhatsApp QR Code</h1>
-        <p>Scan this QR code with WhatsApp to authenticate the bot:</p>
-        <img src="https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(currentQRCode)}&size=300x300" alt="WhatsApp QR Code">
-        <p><small>This QR code will expire when a new one is generated.</small></p>
-      </div>
-    </body>
-    </html>
-  `);
-});
-
-// Delete session endpoint to manually clear an invalid session
-app.post('/delete-session', async (req, res) => {
-  try {
-    await clearInvalidSession();
-    
-    res.status(200).json({
-      success: true,
-      message: 'Session deleted successfully'
-    });
-    
-    // Restart client after session deletion
-    if (client) {
-      try {
-        await client.destroy();
-      } catch (err) {
-        log('error', `Error destroying client after session deletion: ${err.message}`);
-      } finally {
-        client = null;
-      }
-    }
-    
-    setTimeout(startClient, 2000);
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
-  }
-});
-
-// Session check endpoint
-app.get('/session', async (req, res) => {
-  try {
-    const hasSession = await checkSessionStatus();
-    
-    return res.status(200).json({
-      hasSession,
-      sessionState: sessionState,
-      clientState: client ? await client.getState() : 'not_initialized',
-      isBusinessAccount: isBusinessAccount,
-      timestamp: new Date().toISOString()
-    });
-  } catch (err) {
-    return res.status(500).json({
-      error: err.message
-    });
-  }
-});
-
 // Message queue to prevent rate limiting and add human-like behavior
 const messageQueue = [];
 let isProcessingQueue = false;
@@ -1129,6 +959,178 @@ async function processMessageQueue() {
     }
   }
 }
+
+// Enhanced Express server with basic security
+const app = express();
+
+// Security middleware
+app.use((req, res, next) => {
+  // Add security headers
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  
+  // Update activity timestamp to detect Render sleep
+  lastActivityTime = Date.now();
+  
+  next();
+});
+
+// Basic rate limiting
+const requestCounts = new Map();
+const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
+const RATE_LIMIT_MAX = 60; // 60 requests per minute
+
+app.use((req, res, next) => {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  
+  // Clean up old entries
+  if (requestCounts.size > 100) {
+    for (const [key, { timestamp }] of requestCounts.entries()) {
+      if (now - timestamp > RATE_LIMIT_WINDOW) {
+        requestCounts.delete(key);
+      }
+    }
+  }
+  
+  // Check rate limit
+  if (!requestCounts.has(ip)) {
+    requestCounts.set(ip, { count: 1, timestamp: now });
+  } else {
+    const record = requestCounts.get(ip);
+    if (now - record.timestamp > RATE_LIMIT_WINDOW) {
+      // Reset if window expired
+      record.count = 1;
+      record.timestamp = now;
+    } else {
+      record.count++;
+      if (record.count > RATE_LIMIT_MAX) {
+        return res.status(429).json({ 
+          error: 'Too many requests',
+          retry_after: Math.ceil((record.timestamp + RATE_LIMIT_WINDOW - now) / 1000)
+        });
+      }
+    }
+  }
+  
+  next();
+});
+
+app.use(express.json({ limit: '1mb' })); // Limit request body size
+
+// Public health check endpoint
+app.get('/', (_, res) => {
+  const uptime = Date.now() - startedAt;
+  res.status(200).json({
+    status: client ? '✅ Bot running' : '⚠️ Bot initializing',
+    sessionId: SESSION_ID,
+    version: BOT_VERSION,
+    accountType: isBusinessAccount ? 'Business' : 'Regular',
+    sessionState: sessionState,
+    queue: {
+      length: messageQueue.length,
+      sentThisHour: messagesSentLastHour,
+      limit: MAX_MESSAGES_PER_HOUR
+    },
+    uptimeMinutes: Math.floor(uptime / 60000),
+    uptimeHours: Math.floor(uptime / 3600000),
+    uptimeDays: Math.floor(uptime / 86400000),
+    timestamp: new Date().toISOString(),
+    nodeVersion: process.version,
+  });
+});
+
+// Render sleep detection endpoint
+app.post('/prepare-sleep', async (req, res) => {
+  res.status(202).json({
+    success: true,
+    message: 'Preparing for sleep'
+  });
+  
+  await handleRenderSleep();
+});
+
+// QR code access endpoint - access via browser to scan
+app.get('/qr', (req, res) => {
+  if (!currentQRCode) {
+    return res.status(404).send('No QR code available. The bot is either already authenticated or still initializing.');
+  }
+
+  // Generate QR code as HTML
+  res.setHeader('Content-Type', 'text/html');
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>WhatsApp QR Code</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <style>
+        body { font-family: Arial, sans-serif; text-align: center; margin: 20px; }
+        img { max-width: 100%; height: auto; }
+        .container { max-width: 500px; margin: 0 auto; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>WhatsApp QR Code</h1>
+        <p>Scan this QR code with WhatsApp to authenticate the bot:</p>
+        <img src="https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(currentQRCode)}&size=300x300" alt="WhatsApp QR Code">
+        <p><small>This QR code will expire when a new one is generated.</small></p>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
+// Delete session endpoint to manually clear an invalid session
+app.post('/delete-session', async (req, res) => {
+  try {
+    await clearInvalidSession();
+    
+    res.status(200).json({
+      success: true,
+      message: 'Session deleted successfully'
+    });
+    
+    // Restart client after session deletion
+    if (client) {
+      try {
+        await client.destroy();
+      } catch (err) {
+        log('error', `Error destroying client after session deletion: ${err.message}`);
+      } finally {
+        client = null;
+      }
+    }
+    
+    setTimeout(startClient, 2000);
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
+// Session check endpoint
+app.get('/session', async (req, res) => {
+  try {
+    const hasSession = await checkSessionStatus();
+    
+    return res.status(200).json({
+      hasSession,
+      sessionState: sessionState,
+      clientState: client ? await client.getState() : 'not_initialized',
+      isBusinessAccount: isBusinessAccount,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    return res.status(500).json({
+      error: err.message
+    });
+  }
+});
 
 // Start queue processor
 setInterval(processMessageQueue, QUEUE_CHECK_INTERVAL);
