@@ -19,6 +19,25 @@ const RECONNECT_DELAY = parseInt(process.env.RECONNECT_DELAY || '10000');
 const WATCHDOG_INTERVAL = parseInt(process.env.WATCHDOG_INTERVAL || '300000'); // 5 minutes
 const DEBUG_SESSION = true; // Enable session debugging
 
+async function safelyTriggerSessionSave(client) {
+  if (!client) return false;
+  
+  try {
+    // Use the undocumented but working method to request a session save
+    if (client.authStrategy && typeof client.authStrategy.requestSave === 'function') {
+      await client.authStrategy.requestSave();
+      log('info', '📥 Session save requested');
+      return true;
+    } else {
+      log('info', '📥 Session will be saved automatically (no manual save available)');
+      return false;
+    }
+  } catch (err) {
+    log('error', `Failed to request session save: ${err.message}`);
+    return false;
+  }
+}
+
 // Add validation for critical environment variables
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
   console.error('❌ Missing Supabase credentials. Exiting.');
@@ -630,7 +649,7 @@ async function startClient() {
     if (client.authStrategy?.authState) {
       try {
         log('info', '📥 Forcing session save after initialization');
-        await client.authStrategy.save();
+        await safelyTriggerSessionSave(client);
         log('info', '📥 Session saved successfully after initialization');
       } catch (err) {
         log('error', `📥 Failed to save session after initialization: ${err.message}`);
@@ -947,7 +966,7 @@ app.post('/save-session', async (req, res) => {
   
   try {
     log('info', '📥 Manual session save requested');
-    await client.authStrategy.save();
+    await safelyTriggerSessionSave(client);
     log('info', '📥 Manual session save completed');
     
     return res.status(200).json({ 
@@ -976,7 +995,7 @@ app.post('/restart', async (req, res) => {
   if (client && client.authStrategy) {
     try {
       log('info', '📥 Saving session before manual restart');
-      await client.authStrategy.save();
+      await safelyTriggerSessionSave(client);
       log('info', '📥 Session saved before manual restart');
     } catch (err) {
       log('error', `Failed to save session before manual restart: ${err.message}`);
@@ -1025,7 +1044,7 @@ app.listen(PORT, () => {
     if (client && client.authStrategy && client.getState && await client.getState() === 'CONNECTED') {
       try {
         log('info', '📥 Periodic session save triggered');
-        await client.authStrategy.save();
+        await safelyTriggerSessionSave(client);
         log('info', '📥 Periodic session save completed');
       } catch (err) {
         log('error', `Failed to perform periodic session save: ${err.message}`);
@@ -1041,7 +1060,7 @@ app.listen(PORT, () => {
     if (client && client.authStrategy) {
       try {
         log('info', '📥 Saving session before shutdown');
-        await client.authStrategy.save();
+        await safelyTriggerSessionSave(client);
         log('info', '📥 Session saved before shutdown');
       } catch (err) {
         log('error', `Failed to save session before shutdown: ${err.message}`);
@@ -1096,7 +1115,7 @@ setInterval(async () => {
         if (DEBUG_SESSION) {
           log('info', '📥 Watchdog forcing session save');
         }
-        await client.authStrategy.save();
+        await safelyTriggerSessionSave(client);
         if (DEBUG_SESSION) {
           log('info', '📥 Watchdog session save successful');
         }
@@ -1127,7 +1146,7 @@ setInterval(async () => {
           if (client.authStrategy) {
             try {
               log('info', '📥 Saving session before memory-triggered restart');
-              await client.authStrategy.save();
+              await safelyTriggerSessionSave(client);
               log('info', '📥 Session saved before memory-triggered restart');
             } catch (err) {
               log('error', `Failed to save session before memory-triggered restart: ${err.message}`);
@@ -1148,7 +1167,7 @@ setInterval(async () => {
         if (client.authStrategy) {
           try {
             log('info', '📥 Saving session before memory-triggered restart');
-            await client.authStrategy.save();
+            await safelyTriggerSessionSave(client);
             log('info', '📥 Session saved before memory-triggered restart');
           } catch (err) {
             log('error', `Failed to save session before memory-triggered restart: ${err.message}`);
@@ -1172,7 +1191,7 @@ setInterval(async () => {
       if (client.authStrategy) {
         try {
           log('info', '📥 Saving session before pupPage-triggered restart');
-          await client.authStrategy.save();
+          await safelyTriggerSessionSave(client);
           log('info', '📥 Session saved before pupPage-triggered restart');
         } catch (err) {
           log('error', `Failed to save session before pupPage-triggered restart: ${err.message}`);
@@ -1194,7 +1213,7 @@ setInterval(async () => {
       if (client.authStrategy && state !== null) {
         try {
           log('info', '📥 Saving session before state-triggered restart');
-          await client.authStrategy.save();
+          await safelyTriggerSessionSave(client);
           log('info', '📥 Session saved before state-triggered restart');
         } catch (err) {
           log('error', `Failed to save session before state-triggered restart: ${err.message}`);
