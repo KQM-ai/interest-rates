@@ -195,11 +195,12 @@ function createWhatsAppClient() {
 
 function setupClientEvents(c) {
   c.on('qr', qr => {
-    // Store QR code in memory but don't log full URL to keep logs clean
-    currentQRCode = qr;
+    // Log QR code URL for scanning (this is what you need)
+    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qr)}&size=300x300`;
+    log('warn', `📱 Scan QR Code: ${qrUrl}`);
     
-    // Just log that QR is available, don't show the actual code or URL in logs
-    log('info', '📱 New QR code available. Access via /qr endpoint if needed.');
+    // Store QR code in memory for web endpoint access
+    currentQRCode = qr;
     
     // Reset connection retry count when we get a QR code
     connectionRetryCount = 0;
@@ -308,12 +309,8 @@ async function handleIncomingMessage(msg) {
       return;
     }
     
-    // Log message receipt - useful for debugging
-    log('info', `📩 Received message from ${msg.from.replace('@c.us', '').replace('@g.us', ' (group)')}: "${msg.body?.substring(0, 30)}${msg.body?.length > 30 ? '...' : ''}"`);
-    
     // Only process group messages
     if (!msg.from.endsWith('@g.us')) {
-      log('info', '👤 Skipping non-group message');
       return;
     }
 
@@ -345,11 +342,9 @@ async function handleIncomingMessage(msg) {
       (hasReply && replyInfo?.text?.toLowerCase().includes('dear valued partners'));
 
     if (!isImportant) {
-      log('info', `🚫 Skipped non-matching message`);
+      log('info', '🚫 Ignored non-interest rates message.');
       return;
     }
-
-    log('info', `✅ Processing important message: "${text.substring(0, 30)}${text.length > 30 ? '...' : ''}"`);
 
     // Memory usage tracking
     messageCount++;
