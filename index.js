@@ -336,8 +336,9 @@ async function handleIncomingMessage(msg) {
       lastMemoryCheck = now;
       const mem = process.memoryUsage();
       const rssMB = (mem.rss / 1024 / 1024).toFixed(1);
-      const heapMB = (mem.heapUsed / 1024 / 1024).toFixed(1);
-      log('info', `🧠 Memory: RSS=${rssMB}MB, HeapUsed=${heapMB}MB, HeapTotal=${(mem.heapTotal / 1024 / 1024).toFixed(1)}MB`);
+      const heapUsedMB = (mem.heapUsed / 1024 / 1024).toFixed(1);
+      const heapTotalMB = (mem.heapTotal / 1024 / 1024).toFixed(1);
+      log('info', `🧠 Memory: RSS=${rssMB}MB, HeapUsed=${heapUsedMB}MB, HeapTotal=${heapTotalMB}MB`);
 
       // Warning threshold
       if (parseFloat(rssMB) > MEMORY_THRESHOLD_MB) {
@@ -710,7 +711,6 @@ setInterval(async () => {
   
   // Skip if client is initializing
   if (isClientInitializing) {
-    log('info', '⏱️ Watchdog: client is initializing, skipping check');
     return;
   }
   
