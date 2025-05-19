@@ -110,8 +110,8 @@ class SupabaseStore {
         .from('whatsapp_sessions')
         .upsert({ 
           session_key: this.sessionId, 
-          session_data: sessionData,
-          updated_at: new Date().toISOString() 
+          session_data: sessionData
+          // No updated_at field - using only the columns from your schema
         }, { onConflict: 'session_key' });
 
       if (error) throw new Error(`Failed to save session: ${error.message}`);
@@ -187,6 +187,9 @@ function setupClientEvents(c) {
   c.on('qr', qr => {
     const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qr)}&size=300x300`;
     log('warn', `📱 Scan QR Code: ${qrUrl}`);
+    
+    // Also generate QR code in terminal for direct access
+    qrcode.generate(qr, { small: true });
     
     // Reset connection retry count when we get a QR code
     connectionRetryCount = 0;
