@@ -1,4 +1,24 @@
-const fs = require('fs');
+// Public health check endpoint
+app.get('/', (_, res) => {
+  const uptime = Date.now() - startedAt;
+  res.status(200).json({
+    status: client ? '✅ Bot running' : '⚠️ Bot initializing',
+    sessionId: SESSION_ID,
+    version: BOT_VERSION,
+    accountType: isBusinessAccount ? 'Business' : 'Regular',
+    sessionState: sessionState,
+    queue: {
+      length: messageQueue.length,
+      sentThisHour: messagesSentLastHour,
+      limit: MAX_MESSAGES_PER_HOUR
+    },
+    uptimeMinutes: Math.floor(uptime / 60000),
+    uptimeHours: Math.floor(uptime / 3600000),
+    uptimeDays: Math.floor(uptime / 86400000),
+    timestamp: new Date().toISOString(),
+    nodeVersion: process.version,
+  });
+});const fs = require('fs');
 const path = require('path');
 const qrcode = require('qrcode-terminal');
 const express = require('express');
@@ -904,26 +924,14 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '1mb' })); // Limit request body size
 
-// Public health check endpoint
-app.get('/', (_, res) => {
-  const uptime = Date.now() - startedAt;
-  res.status(200).json({
-    status: client ? '✅ Bot running' : '⚠️ Bot initializing',
-    sessionId: SESSION_ID,
-    version: BOT_VERSION,
-    accountType: isBusinessAccount ? 'Business' : 'Regular',
-    sessionState: sessionState,
-    queue: {
-      length: messageQueue.length,
-      sentThisHour: messagesSentLastHour,
-      limit: MAX_MESSAGES_PER_HOUR
-    },
-    uptimeMinutes: Math.floor(uptime / 60000),
-    uptimeHours: Math.floor(uptime / 3600000),
-    uptimeDays: Math.floor(uptime / 86400000),
-    timestamp: new Date().toISOString(),
-    nodeVersion: process.version,
+// Render sleep detection endpoint
+app.post('/prepare-sleep', async (req, res) => {
+  res.status(202).json({
+    success: true,
+    message: 'Preparing for sleep'
   });
+  
+  await handleRenderSleep();
 });
 
 // QR code access endpoint - access via browser to scan
@@ -1012,7 +1020,6 @@ const messageQueue = [];
 let isProcessingQueue = false;
 let messagesSentLastHour = 0;
 let lastHourReset = Date.now();
-const MAX_MESSAGES_PER_HOUR = 90; // Keeping below 100/hour limit
 const QUEUE_CHECK_INTERVAL = 2000; // Check queue every 2 seconds
 
 // Process message queue with human-like delays
