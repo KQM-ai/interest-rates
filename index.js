@@ -9,7 +9,7 @@ const { Client, RemoteAuth, MessageMedia } = require('whatsapp-web.js');
 // --- Config ---
 const PORT = process.env.PORT || 3000;
 const SESSION_ID = process.env.WHATSAPP_SESSION_ID || 'default_session';
-const BOT_VERSION = '1.0.1'; // Updated version
+const BOT_VERSION = '1.0.2'; // Updated version
 const startedAt = Date.now();
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -111,7 +111,7 @@ class SupabaseStore {
         .upsert({ 
           session_key: this.sessionId, 
           session_data: sessionData
-          // No updated_at field - using only the columns from your schema
+          // Only using fields that exist in your schema
         }, { onConflict: 'session_key' });
 
       if (error) throw new Error(`Failed to save session: ${error.message}`);
@@ -136,6 +136,7 @@ const supabaseStore = new SupabaseStore(supabase, SESSION_ID);
 let client = null;
 let connectionRetryCount = 0;
 let isClientInitializing = false;
+let currentQRCode = null;
 
 // Improved WhatsApp client creation with better error handling
 function createWhatsAppClient() {
@@ -172,24 +173,33 @@ function createWhatsAppClient() {
         '--disable-gpu',
         '--disable-extensions',
         '--disable-features=site-per-process',
-        '--js-flags="--max-old-space-size=500"', // Limit Node.js memory for puppeteer
+        '--js-flags="--max-old-space-size=256"', // Reduced memory limit
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--disable-site-isolation-trials',
       ],
+      defaultViewport: { width: 800, height: 600 },
       timeout: 120000, // 2 minute timeout for browser launch
+      protocolTimeout: 60000, // Protocol timeout to reduce errors
+    },
+    webVersionCache: {
+      type: 'remote',
+      remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/4.0.0.html',
     },
     qrTimeout: 0, // Never timeout waiting for QR
     restartOnAuthFail: true,
-    takeoverOnConflict: true, // Take over session if logged in elsewhere
+    takeoverOnConflict: true,
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
   });
 }
 
 function setupClientEvents(c) {
   c.on('qr', qr => {
-    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qr)}&size=300x300`;
-    log('warn', `📱 Scan QR Code: ${qrUrl}`);
+    // Store QR code in memory but don't log full URL to keep logs clean
+    currentQRCode = qr;
     
-    // Also generate QR code in terminal for direct access
-    qrcode.generate(qr, { small: true });
+    // Just log that QR is available, don't show the actual code or URL in logs
+    log('info', '📱 New QR code available. Access via /qr endpoint if needed.');
     
     // Reset connection retry count when we get a QR code
     connectionRetryCount = 0;
@@ -198,6 +208,7 @@ function setupClientEvents(c) {
   c.on('ready', () => {
     log('info', '✅ WhatsApp client is ready.');
     connectionRetryCount = 0; // Reset retry count on successful connection
+    currentQRCode = null; // Clear QR code on ready
     
     // Force garbage collection if available
     if (global.gc) {
@@ -208,6 +219,7 @@ function setupClientEvents(c) {
 
   c.on('authenticated', () => {
     log('info', '🔐 Client authenticated.');
+    currentQRCode = null; // Clear QR code once authenticated
   });
 
   c.on('remote_session_saved', () => {
@@ -216,6 +228,7 @@ function setupClientEvents(c) {
 
   c.on('disconnected', async reason => {
     log('warn', `Client disconnected: ${reason}`);
+    currentQRCode = null;
     
     if (client) {
       try {
@@ -236,6 +249,7 @@ function setupClientEvents(c) {
 
   c.on('auth_failure', async msg => {
     log('error', `❌ Auth failed: ${msg}. Clearing session.`);
+    currentQRCode = null;
     
     // Clear the session data
     try {
@@ -271,7 +285,10 @@ function setupClientEvents(c) {
   
   // Additional event handlers for better monitoring
   c.on('loading_screen', (percent, message) => {
-    log('info', `Loading: ${percent}% - ${message}`);
+    // Only log significant loading changes to reduce log noise
+    if (percent === 0 || percent === 100 || percent % 25 === 0) {
+      log('info', `Loading: ${percent}% - ${message}`);
+    }
   });
   
   c.on('change_state', state => {
@@ -282,7 +299,7 @@ function setupClientEvents(c) {
 let messageCount = 0;
 let lastMemoryCheck = 0;
 
-// Improved message handler with better error handling and throttling
+// Improved message handler with better error handling and verbose logging
 async function handleIncomingMessage(msg) {
   try {
     // Basic validation
@@ -291,8 +308,12 @@ async function handleIncomingMessage(msg) {
       return;
     }
     
+    // Log message receipt - useful for debugging
+    log('info', `📩 Received message from ${msg.from.replace('@c.us', '').replace('@g.us', ' (group)')}: "${msg.body?.substring(0, 30)}${msg.body?.length > 30 ? '...' : ''}"`);
+    
     // Only process group messages
     if (!msg.from.endsWith('@g.us')) {
+      log('info', '👤 Skipping non-group message');
       return;
     }
 
@@ -324,8 +345,11 @@ async function handleIncomingMessage(msg) {
       (hasReply && replyInfo?.text?.toLowerCase().includes('dear valued partners'));
 
     if (!isImportant) {
-      return; // Skip unimportant messages silently
+      log('info', `🚫 Skipped non-matching message`);
+      return;
     }
+
+    log('info', `✅ Processing important message: "${text.substring(0, 30)}${text.length > 30 ? '...' : ''}"`);
 
     // Memory usage tracking
     messageCount++;
@@ -374,7 +398,8 @@ async function handleIncomingMessage(msg) {
 // Improved webhook sender with better retry logic and timeout handling
 async function sendToN8nWebhook(payload, attempt = 0) {
   if (!N8N_WEBHOOK_URL) {
-    return; // Silently skip if webhook URL is not set
+    log('warn', '⚠️ N8N_WEBHOOK_URL not set. Webhook skipped.');
+    return;
   }
 
   // Truncate long texts to avoid large payloads
@@ -396,6 +421,8 @@ async function sendToN8nWebhook(payload, attempt = 0) {
     // Use exponential backoff for retries
     const timeout = Math.min(10000 + attempt * 5000, 30000); // Increase timeout with each attempt, max 30s
     
+    log('info', `📤 Sending webhook to n8n (${payloadSize} bytes)...`);
+    
     await axios.post(N8N_WEBHOOK_URL, payload, { 
       timeout,
       headers: {
@@ -406,7 +433,7 @@ async function sendToN8nWebhook(payload, attempt = 0) {
       maxRedirects: 0,
     });
     
-    log('info', `✅ Webhook sent (${payloadSize} bytes).`);
+    log('info', `✅ Webhook sent successfully`);
   } catch (err) {
     const status = err.response?.status;
     const isNetworkError = !status; // axios network errors don't have status
@@ -439,6 +466,7 @@ async function startClient() {
   }
 
   isClientInitializing = true;
+  currentQRCode = null;
   
   try {
     log('info', '🚀 Starting WhatsApp client...');
@@ -540,6 +568,38 @@ app.get('/', (_, res) => {
   });
 });
 
+// QR code access endpoint - access via browser to scan
+app.get('/qr', (req, res) => {
+  if (!currentQRCode) {
+    return res.status(404).send('No QR code available. The bot is either already authenticated or still initializing.');
+  }
+
+  // Generate QR code as HTML
+  res.setHeader('Content-Type', 'text/html');
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>WhatsApp QR Code</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <style>
+        body { font-family: Arial, sans-serif; text-align: center; margin: 20px; }
+        img { max-width: 100%; height: auto; }
+        .container { max-width: 500px; margin: 0 auto; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>WhatsApp QR Code</h1>
+        <p>Scan this QR code with WhatsApp to authenticate the bot:</p>
+        <img src="https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(currentQRCode)}&size=300x300" alt="WhatsApp QR Code">
+        <p><small>This QR code will expire when a new one is generated.</small></p>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
 // Message sending endpoint - no API key required as requested
 app.post('/send-message', async (req, res) => {
   const { jid, message, imageUrl } = req.body;
@@ -604,6 +664,28 @@ app.post('/send-message', async (req, res) => {
   }
 });
 
+// Test endpoint to verify bot is working
+app.get('/test-message/:jid', async (req, res) => {
+  const jid = req.params.jid;
+  
+  if (!client) {
+    return res.status(503).json({ success: false, error: 'WhatsApp client not ready' });
+  }
+  
+  try {
+    const sentMessage = await client.sendMessage(jid, 'This is a test message from the WhatsApp bot');
+    log('info', `Test message sent to ${jid}`);
+    return res.status(200).json({ 
+      success: true, 
+      messageId: sentMessage.id.id,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    log('error', `Error sending test message: ${err.message}`);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Get client status endpoint
 app.get('/status', async (req, res) => {
   try {
@@ -630,6 +712,7 @@ app.get('/status', async (req, res) => {
         external: Math.round(mem.external / 1024 / 1024),
       },
       messagesProcessed: messageCount,
+      needsQrScan: Boolean(currentQRCode),
       timestamp: new Date().toISOString()
     });
   } catch (err) {
